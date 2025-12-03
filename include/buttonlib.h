@@ -1,3 +1,9 @@
+/**
+ * @file buttonlib.h
+ * @brief Professional Button Library for RP2040
+ * @version 3.0.0 (Gold Master)
+ */
+
 #ifndef BUTTONLIB_H
 #define BUTTONLIB_H
 
@@ -9,99 +15,104 @@ extern "C" {
 #include <stdbool.h>
 #include <stddef.h>
 
-// --- Типы событий ---
+// --- События ---
+
 typedef enum {
-    BTN_EVT_DOWN = 0,       // Нажатие
-    BTN_EVT_UP,             // Отпускание
-    BTN_EVT_CLICK,          // Клик (одинарный, двойной и т.д. см. clicks_count)
-    BTN_EVT_LONG_START,     // Старт длинного нажатия
-    BTN_EVT_LONG_HOLD,      // Удержание (аналог REPEAT)
-} button_event_type_t;
+    BTN_EVT_DOWN = 0,       ///< Нажатие (фронт)
+    BTN_EVT_UP,             ///< Отпускание (спад)
+    BTN_EVT_CLICK,          ///< Клик завершен (Single, Double, Triple...)
+    BTN_EVT_LONG_START,     ///< Старт долгого нажатия
+    BTN_EVT_LONG_HOLD,      ///< Удержание (автоповтор)
+} btn_event_type_t;
 
-// --- Данные события ---
 typedef struct {
-    uint8_t button_id;          // ID кнопки
-    button_event_type_t type;   // Тип
-    uint8_t clicks_count;       // Кол-во кликов (для EVT_CLICK) или повторов (для EVT_LONG_HOLD)
-    uint64_t timestamp;         // Время события
-} button_event_t;
+    uint8_t btn_id;         ///< ID кнопки
+    btn_event_type_t type;  ///< Тип
+    uint8_t clicks;         ///< Количество кликов (для EVT_CLICK) или счетчик повторов (для HOLD)
+    uint64_t timestamp;     ///< Время события (мкс)
+} btn_event_t;
 
-// --- Прототип функции чтения GPIO ---
-typedef bool (*button_read_fn_t)(void *arg);
+// --- Типы функций ---
 
-// --- Прототип Callback'а (Опционально) ---
-// Если возвращает true, событие НЕ попадает в общую очередь (перехвачено).
-typedef bool (*button_cb_t)(const button_event_t *evt, void *user_data);
+typedef bool (*btn_read_fn_t)(void *arg);
+typedef bool (*btn_cb_t)(const btn_event_t *evt, void *user_data);
 
-// --- Конфигурация (ROM) ---
+// --- Конфигурация и Состояние ---
+
 typedef struct {
-    uint8_t id;                 
-    bool active_low;            // true: 0 = нажата
-
+    uint8_t id;             ///< Уникальный ID
+    bool active_low;        ///< true = замыкание на землю (GND)
+    
     // Драйвер
-    button_read_fn_t read_fn;   
-    void *hw_arg;               
+    btn_read_fn_t read_fn;
+    void *hw_arg;
 
-    // Опциональный callback (если NULL - только очередь)
-    button_cb_t callback;
+    // Опциональный колбэк
+    btn_cb_t callback;
     void *cb_user_data;
 
-    // Тайминги (ms)
-    uint16_t debounce_ms;       // 20-50
-    uint16_t click_timeout_ms;  // Время ожидания следующего клика (для Multi-click)
-    uint16_t long_press_ms;     // Время до срабатывания Long Press
-    uint16_t repeat_period_ms;  // 0 = выкл. Период генерации событий удержания
-} button_config_t;
+    // Тайминги (мс)
+    uint16_t debounce_ms;       ///< Антидребезг (20-50)
+    uint16_t click_timeout_ms;  ///< Таймаут для мульти-клика (200-500)
+    uint16_t long_press_ms;     ///< Время удержания
+    uint16_t repeat_period_ms;  ///< Период повтора (0 = выкл)
+} btn_config_t;
 
-// --- Состояние (RAM) ---
 typedef struct {
-    // Фильтрация
-    bool logic_state;           
-    bool raw_state;             
+    bool logic_state;           ///< Текущее логическое состояние
+    bool raw_state;             ///< Сырое состояние
+    bool suppressed;            ///< Флаг подавления (для комбо)
+    
     uint64_t last_debounce_time;
-
-    // FSM
-    uint64_t state_start_time;  
+    uint64_t state_start_time;  ///< Время нажатия
+    uint64_t last_release_time; ///< Время последнего отпускания (для таймаута клика)
     uint64_t last_repeat_time;  
     
-    // Multi-click logic
-    uint8_t click_count;        // Текущий счетчик кликов
-    bool waiting_release;       // Ждем отпускания для засчитывания клика
-} button_state_t;
+    uint8_t click_count;        ///< Накопитель кликов
+    uint8_t hold_repeat_count;  ///< Счётчик повторов LONG_HOLD в рамках одного удержания
+} btn_state_t;
 
-// --- Объект кнопки ---
 typedef struct {
-    const button_config_t *config;
-    button_state_t *state;
-} button_t;
+    const btn_config_t *config;
+    btn_state_t *state;
+} btn_instance_t;
 
-// --- Контекст ---
 typedef struct {
-    button_t *buttons;
-    size_t button_count;
-    button_event_t *queue;
+    btn_instance_t *buttons;
+    size_t btn_count;
+    btn_event_t *queue;
     size_t queue_size;
     size_t head;
     size_t tail;
-} button_context_t;
+} btn_context_t;
 
 // --- API ---
 
-bool btn_init(button_context_t *ctx, button_t *buttons, size_t count, button_event_t *queue, size_t q_size);
+// Инициализация системы
+bool btn_init(btn_context_t *ctx, btn_instance_t *buttons, size_t count, btn_event_t *queue, size_t q_size);
 
-// Настройка кнопки. index < count
-void btn_setup(button_context_t *ctx, uint8_t index, const button_config_t *cfg, button_state_t *st);
+// Настройка отдельной кнопки
+void btn_setup(btn_context_t *ctx, uint8_t index, const btn_config_t *cfg, btn_state_t *st);
 
-// Главный цикл. Вызывать каждые 1-10 мс.
-void btn_update(button_context_t *ctx, uint64_t now_us);
+// Главный цикл (вызывать каждые 1-10 мс)
+void btn_update(btn_context_t *ctx, uint64_t now_us);
 
-// Чтение события (FIFO). Возвращает true, если событие есть.
-bool btn_pop_event(button_context_t *ctx, button_event_t *evt);
+// Чтение события из очереди
+bool btn_pop_event(btn_context_t *ctx, btn_event_t *evt);
 
-// Очистка очереди
-void btn_flush_queue(button_context_t *ctx);
+// --- Хелперы ---
+
+// Проверка нажатия (true/false)
+bool btn_is_pressed(btn_context_t *ctx, uint8_t btn_id);
+
+// Время удержания в мкс (0 если не нажата)
+uint64_t btn_get_duration(btn_context_t *ctx, uint8_t btn_id, uint64_t now_us);
+
+// Принудительный сброс состояния (для обработки комбо)
+void btn_suppress_events(btn_context_t *ctx, uint8_t btn_id);
 
 #ifdef __cplusplus
 }
 #endif
-#endif
+
+#endif // BUTTONLIB_H

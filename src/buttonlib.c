@@ -2,175 +2,180 @@
 #include <string.h>
 
 #define MS_TO_US(x) ((uint64_t)(x) * 1000ULL)
+#define LONG_PRESS_ACTIVE 0xFF
 
-static void enqueue_event(button_context_t *ctx, button_event_t evt) {
-    // 1. Сначала пробуем вызвать Callback, если он задан для этой кнопки
-    // Находим конфиг кнопки по ID (немного неэффективно искать перебором, 
-    // но надежнее. В button_t нет обратной ссылки на ctx).
-    // Оптимизация: передаем указатель на config прямо в update loop, 
-    // поэтому вызов callback будет там, а не здесь.
-    // Здесь только очередь.
-    
-    if (ctx->queue == NULL || ctx->queue_size == 0) return;
-
-    size_t next_head = (ctx->head + 1) % ctx->queue_size;
-
-    // ПЕРЕЗАПИСЬ (Overwriting): Если голова догнала хвост, двигаем хвост
-    if (next_head == ctx->tail) {
-        ctx->tail = (ctx->tail + 1) % ctx->queue_size;
+static int find_index(btn_context_t *ctx, uint8_t id) {
+    for (size_t i = 0; i < ctx->btn_count; i++) {
+        if (ctx->buttons[i].config && ctx->buttons[i].config->id == id) return (int)i;
     }
-
-    ctx->queue[ctx->head] = evt;
-    ctx->head = next_head;
+    return -1;
 }
 
-// Внутренняя функция отправки события
-static void emit(button_context_t *ctx, const button_config_t *cfg, 
-                 button_event_type_t type, uint8_t count, uint64_t now) {
+static void push_event(btn_context_t *ctx, btn_event_t evt) {
+    if (!ctx->queue || ctx->queue_size == 0) return;
+    size_t next = (ctx->head + 1) % ctx->queue_size;
     
-    button_event_t evt = {
-        .button_id = cfg->id,
+    // Overwrite old events if full
+    if (next == ctx->tail) {
+        ctx->tail = (ctx->tail + 1) % ctx->queue_size; 
+    }
+    
+    ctx->queue[ctx->head] = evt;
+    ctx->head = next;
+}
+
+static void emit(btn_context_t *ctx, const btn_config_t *cfg, btn_state_t *st,
+                 btn_event_type_t type, uint8_t clicks, uint64_t now) {
+    
+    if (st->suppressed) return;
+
+    btn_event_t evt = {
+        .btn_id = cfg->id,
         .type = type,
-        .clicks_count = count,
+        .clicks = clicks,
         .timestamp = now
     };
 
-    // Callback Priority
-    if (cfg->callback) {
-        // Если колбэк вернул true, значит событие обработано и не нужно в очередь
-        if (cfg->callback(&evt, cfg->cb_user_data)) {
-            return;
-        }
-    }
-
-    enqueue_event(ctx, evt);
+    if (cfg->callback && cfg->callback(&evt, cfg->cb_user_data)) return;
+    push_event(ctx, evt);
 }
 
-bool btn_init(button_context_t *ctx, button_t *buttons, size_t count, 
-              button_event_t *queue, size_t q_size) {
+// --- API ---
+
+bool btn_init(btn_context_t *ctx, btn_instance_t *buttons, size_t count, btn_event_t *queue, size_t q_size) {
     if (!ctx || !buttons) return false;
-    
+    memset(ctx, 0, sizeof(btn_context_t));
     ctx->buttons = buttons;
-    ctx->button_count = count;
+    ctx->btn_count = count;
     ctx->queue = queue;
     ctx->queue_size = q_size;
-    ctx->head = 0;
-    ctx->tail = 0;
     return true;
 }
 
-void btn_setup(button_context_t *ctx, uint8_t index, 
-               const button_config_t *cfg, button_state_t *st) {
-    if (index >= ctx->button_count) return;
-    memset(st, 0, sizeof(button_state_t));
+void btn_setup(btn_context_t *ctx, uint8_t index, const btn_config_t *cfg, btn_state_t *st) {
+    if (index >= ctx->btn_count) return;
+    memset(st, 0, sizeof(btn_state_t));
     ctx->buttons[index].config = cfg;
     ctx->buttons[index].state = st;
 }
 
-void btn_update(button_context_t *ctx, uint64_t now_us) {
-    for (size_t i = 0; i < ctx->button_count; i++) {
-        const button_config_t *cfg = ctx->buttons[i].config;
-        button_state_t *st = ctx->buttons[i].state;
-        if (!cfg || !st) continue; // Skip unconfigured slots
+void btn_update(btn_context_t *ctx, uint64_t now_us) {
+    for (size_t i = 0; i < ctx->btn_count; i++) {
+        const btn_config_t *cfg = ctx->buttons[i].config;
+        btn_state_t *st = ctx->buttons[i].state;
+        if (!cfg || !st) continue;
 
-        // --- 1. Debounce ---
+        // 1. Hardware Read
         bool raw = cfg->read_fn(cfg->hw_arg);
         if (cfg->active_low) raw = !raw;
 
+        // 2. Debounce
         if (raw != st->raw_state) {
             st->last_debounce_time = now_us;
             st->raw_state = raw;
         }
 
         bool stable = st->logic_state;
-        // Если сигнал стабилен дольше debounce времени
         if ((now_us - st->last_debounce_time) > MS_TO_US(cfg->debounce_ms)) {
             if (st->logic_state != raw) {
-                // Изменение состояния
                 stable = raw;
                 st->logic_state = raw;
-
+                
                 if (stable) {
                     // -> PRESSED
                     st->state_start_time = now_us;
                     st->last_repeat_time = now_us;
-                    emit(ctx, cfg, BTN_EVT_DOWN, 0, now_us);
+                    st->suppressed = false; // Reset suppression on new press
+                    emit(ctx, cfg, st, BTN_EVT_DOWN, 0, now_us);
                 } else {
                     // -> RELEASED
-                    emit(ctx, cfg, BTN_EVT_UP, 0, now_us);
+                    emit(ctx, cfg, st, BTN_EVT_UP, 0, now_us);
                     
-                    // Логика мульти-клика:
-                    // Если мы отпустили кнопку ДО long_press, это потенциальный клик
-                    uint64_t press_dur = now_us - st->state_start_time;
-                    if (press_dur < MS_TO_US(cfg->long_press_ms)) {
-                        st->click_count++; 
-                        // Таймер сбрасывается при каждом отпускании в серии
-                        st->state_start_time = now_us; // Используем это поле как таймер таймаута клика
-                    } else {
-                        // Если было удержание, сбрасываем счетчик кликов
-                        st->click_count = 0;
+                    if (!st->suppressed) {
+                        uint64_t duration = now_us - st->state_start_time;
+                        // Если это было короткое нажатие - засчитываем в серию
+                        if (duration < MS_TO_US(cfg->long_press_ms)) {
+                            st->click_count++;
+                            st->last_release_time = now_us; // Таймер таймаута серии
+                        } else {
+                            st->click_count = 0; // Длинное нажатие обнуляет серию
+                        }
                     }
                 }
             }
         }
 
-        // --- 2. Обработка состояний (Timeouts & Holds) ---
+        // 3. Logic (Timeouts & Holds)
         if (stable) {
-            // == Кнопка НАЖАТА ==
+            // == HELD ==
             uint64_t hold_time = now_us - st->state_start_time;
-
-            // Long Press
+            
             if (hold_time > MS_TO_US(cfg->long_press_ms)) {
-                // Если мы только что перешагнули порог (используем click_count как флаг "long press already sent" для экономии памяти)
-                // Сброс click_count в 0xFF означает "Long Press активен"
-                if (st->click_count != 0xFF) {
-                    st->click_count = 0xFF; // Маркер: длинное нажатие активировано
-                    emit(ctx, cfg, BTN_EVT_LONG_START, 0, now_us);
+                if (st->click_count != LONG_PRESS_ACTIVE) {
+                    st->click_count = LONG_PRESS_ACTIVE; // Mark as handled
+                    emit(ctx, cfg, st, BTN_EVT_LONG_START, 0, now_us);
                     st->last_repeat_time = now_us;
                 }
                 
-                // Repeat (Long Hold)
+                // Auto-Repeat
                 if (cfg->repeat_period_ms > 0) {
                     if ((now_us - st->last_repeat_time) > MS_TO_US(cfg->repeat_period_ms)) {
-                        static uint8_t rep_cnt = 0; // Можно хранить в state если нужно точно
-                        rep_cnt++;
-                        emit(ctx, cfg, BTN_EVT_LONG_HOLD, rep_cnt, now_us);
+                        st->hold_repeat_count++;
+                        emit(ctx, cfg, st, BTN_EVT_LONG_HOLD, st->hold_repeat_count, now_us);
                         st->last_repeat_time = now_us;
                     }
                 }
             }
         } else {
-            // == Кнопка ОТПУЩЕНА ==
-            // Проверка таймаута мульти-клика
-            if (st->click_count > 0 && st->click_count != 0xFF) {
-                uint64_t release_time = now_us - st->state_start_time; // start_time обновлен при отпускании
-                if (release_time > MS_TO_US(cfg->click_timeout_ms)) {
-                    // Таймаут вышел, отправляем накопленные клики
-                    // 1 = Single, 2 = Double, 3 = Triple...
-                    if (st->click_count == 1) {
-                         emit(ctx, cfg, BTN_EVT_CLICK, 1, now_us); // Single
-                    } else {
-                         // Double и более. Тип CLICK, в поле count число.
-                         // Можно сделать отдельный enum для DOUBLE, но универсальный CLICK удобнее.
-                         emit(ctx, cfg, BTN_EVT_CLICK, st->click_count, now_us);
+            // == IDLE ==
+            // Check Click Timeout
+            if (st->click_count > 0 && st->click_count != LONG_PRESS_ACTIVE) {
+                if ((now_us - st->last_release_time) > MS_TO_US(cfg->click_timeout_ms)) {
+                    if (!st->suppressed) {
+                        emit(ctx, cfg, st, BTN_EVT_CLICK, st->click_count, now_us);
                     }
                     st->click_count = 0;
+                    st->hold_repeat_count = 0;
                 }
-            } else {
-                 // Если был Long Press (0xFF), сбрасываем при отпускании
-                 if (st->click_count == 0xFF) st->click_count = 0;
+            }
+            // Reset LongPress flag on release (cleanup)
+            if (st->click_count == LONG_PRESS_ACTIVE) {
+                st->click_count = 0;
+                st->hold_repeat_count = 0;
             }
         }
     }
 }
 
-bool btn_pop_event(button_context_t *ctx, button_event_t *evt) {
+bool btn_pop_event(btn_context_t *ctx, btn_event_t *evt) {
     if (ctx->head == ctx->tail) return false;
     *evt = ctx->queue[ctx->tail];
     ctx->tail = (ctx->tail + 1) % ctx->queue_size;
     return true;
 }
 
-void btn_flush_queue(button_context_t *ctx) {
-    ctx->tail = ctx->head;
+bool btn_is_pressed(btn_context_t *ctx, uint8_t btn_id) {
+    int i = find_index(ctx, btn_id);
+    return (i >= 0) ? ctx->buttons[i].state->logic_state : false;
+}
+
+uint64_t btn_get_duration(btn_context_t *ctx, uint8_t btn_id, uint64_t now_us) {
+    int i = find_index(ctx, btn_id);
+    if (i < 0) return 0;
+    btn_state_t *st = ctx->buttons[i].state;
+    if (!st->logic_state) return 0;
+    
+    // Защита от переполнения времени (хотя с 64 битами маловероятно)
+    return (now_us >= st->state_start_time) ? (now_us - st->state_start_time) : 0;
+}
+
+void btn_suppress_events(btn_context_t *ctx, uint8_t btn_id) {
+    int i = find_index(ctx, btn_id);
+    if (i >= 0) {
+        btn_state_t *st = ctx->buttons[i].state;
+        st->suppressed = true;
+        st->click_count = 0;
+        st->hold_repeat_count = 0;
+        // оставляем временные метки как есть — после нового BTN_EVT_DOWN suppression снимется автоматически
+    }
 }
