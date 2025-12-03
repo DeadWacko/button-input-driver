@@ -1,4 +1,4 @@
-# ButtonLib — Professional Button Library for RP2040
+# ButtonLib —  Button Library for RP2040
 
 **Version:** 3.1.0  
 **Target:** RP2040 (Raspberry Pi Pico / Pico W и др.)
