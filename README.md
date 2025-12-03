@@ -152,8 +152,3 @@ typedef enum {
 
 ---
 
-## License
-
-(Укажи нужную лицензию: MIT / BSD / Proprietary / etc.)
-
-````
