@@ -84,6 +84,11 @@ typedef struct {
     size_t queue_size;
     size_t head;
     size_t tail;
+
+    // Counter of overwritten (dropped) events due to queue overflow.
+    // Useful for diagnostics and performance tuning.
+    size_t dropped_events;
+
 } btn_context_t;
 
 // --- API ---

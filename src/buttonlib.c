@@ -1,6 +1,7 @@
 #include "buttonlib.h"
 #include <string.h>
 
+// Safe microsecond->microsecond conversion
 #define MS_TO_US(x) ((uint64_t)(x) * 1000ULL)
 #define LONG_PRESS_ACTIVE 0xFF
 
@@ -15,9 +16,11 @@ static void push_event(btn_context_t *ctx, btn_event_t evt) {
     if (!ctx->queue || ctx->queue_size == 0) return;
     size_t next = (ctx->head + 1) % ctx->queue_size;
     
-    // Overwrite old events if full
+    // Overwrite-oldest strategy:
+    // When buffer is full, drop the oldest event and increment diagnostic counter.
     if (next == ctx->tail) {
         ctx->tail = (ctx->tail + 1) % ctx->queue_size; 
+        ctx->dropped_events++;
     }
     
     ctx->queue[ctx->head] = evt;
@@ -55,6 +58,13 @@ bool btn_init(btn_context_t *ctx, btn_instance_t *buttons, size_t count, btn_eve
 void btn_setup(btn_context_t *ctx, uint8_t index, const btn_config_t *cfg, btn_state_t *st) {
     if (index >= ctx->btn_count) return;
     memset(st, 0, sizeof(btn_state_t));
+
+    // Validate configuration: read_fn must be non-null.
+    if (!cfg || !cfg->read_fn) {
+        ctx->buttons[index].config = NULL;
+        return;
+    }
+
     ctx->buttons[index].config = cfg;
     ctx->buttons[index].state = st;
 }
@@ -64,6 +74,7 @@ void btn_update(btn_context_t *ctx, uint64_t now_us) {
         const btn_config_t *cfg = ctx->buttons[i].config;
         btn_state_t *st = ctx->buttons[i].state;
         if (!cfg || !st) continue;
+        if (!cfg->read_fn) continue; // Safety
 
         // 1. Hardware Read
         bool raw = cfg->read_fn(cfg->hw_arg);
@@ -84,6 +95,7 @@ void btn_update(btn_context_t *ctx, uint64_t now_us) {
                 if (stable) {
                     // -> PRESSED
                     st->state_start_time = now_us;
+                    st->hold_repeat_count = 0;
                     st->last_repeat_time = now_us;
                     st->suppressed = false; // Reset suppression on new press
                     emit(ctx, cfg, st, BTN_EVT_DOWN, 0, now_us);
@@ -113,6 +125,10 @@ void btn_update(btn_context_t *ctx, uint64_t now_us) {
             if (hold_time > MS_TO_US(cfg->long_press_ms)) {
                 if (st->click_count != LONG_PRESS_ACTIVE) {
                     st->click_count = LONG_PRESS_ACTIVE; // Mark as handled
+                    
+                    // Reset per-hold counters
+                    st->hold_repeat_count = 0;
+                    
                     emit(ctx, cfg, st, BTN_EVT_LONG_START, 0, now_us);
                     st->last_repeat_time = now_us;
                 }
@@ -120,7 +136,9 @@ void btn_update(btn_context_t *ctx, uint64_t now_us) {
                 // Auto-Repeat
                 if (cfg->repeat_period_ms > 0) {
                     if ((now_us - st->last_repeat_time) > MS_TO_US(cfg->repeat_period_ms)) {
-                        st->hold_repeat_count++;
+                        // Increment with saturation at 255 to avoid wraparound
+                        if (st->hold_repeat_count < 0xFF)
+                            st->hold_repeat_count++;
                         emit(ctx, cfg, st, BTN_EVT_LONG_HOLD, st->hold_repeat_count, now_us);
                         st->last_repeat_time = now_us;
                     }
@@ -173,9 +191,21 @@ void btn_suppress_events(btn_context_t *ctx, uint8_t btn_id) {
     int i = find_index(ctx, btn_id);
     if (i >= 0) {
         btn_state_t *st = ctx->buttons[i].state;
+        
+        // Suppress all further events until next BTN_EVT_DOWN
         st->suppressed = true;
+
+        // Reset counters
         st->click_count = 0;
         st->hold_repeat_count = 0;
-        // оставляем временные метки как есть — после нового BTN_EVT_DOWN suppression снимется автоматически
+
+        // Logical reset: the button is now considered released,
+        // but raw_state stays unchanged to avoid losing real edges.
+        st->logic_state = false;
+
+        // Reset timers so any future timing-based actions start from scratch
+        st->state_start_time = 0;
+        st->last_release_time = 0;
+        st->last_repeat_time = 0;
     }
 }
